@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import joblib
 import shap
 import os
@@ -14,6 +15,14 @@ st.set_page_config(page_title="Risk Scoring System", layout="wide")
 # LOAD ARTIFACTS
 # ----------------------------
 model = joblib.load("artifacts/model.pkl")
+import json
+
+booster = model.get_booster()
+config = json.loads(booster.save_config())
+
+config["learner"]["learner_model_param"]["base_score"] = "0.5"
+
+booster.load_config(json.dumps(config))
 model.set_params(base_score=0.5)
 
 
@@ -82,7 +91,25 @@ def predict_risk(input_data):
 # ----------------------------
 @st.cache_resource
 def load_explainer():
-    return shap.Explainer(model.predict_proba)
+    # ✅ Use SAME feature engineering
+    background = data.sample(100)
+
+    background_X = background.apply(lambda row: prepare_features({
+        "claim_amount": row["claim_amount"],
+        "length_of_stay": row["length_of_stay"],
+        "provider_experience": row["provider_experience"],
+        "historical_denials": row["historical_denials"],
+        "readmission_flag": row["readmission_flag"],
+        "repeat_procedure_flag": row["repeat_procedure_flag"],
+    }), axis=1)
+
+    background_X = pd.concat(background_X.tolist(), ignore_index=True)
+
+    return shap.Explainer(
+        model.predict_proba,
+        masker=background_X   # ✅ NOW MATCHES X
+    
+    )
 # ----------------------------
 # TABS
 # ----------------------------
@@ -226,13 +253,47 @@ with tab2:
 
         _, _, X = predict_risk(input_data)
 
+      
         # FAST SHAP
+        import numpy as np
+
         X = X.astype(float)
+
+        explainer = load_explainer()
         shap_values = explainer(X)
+
+# ✅ Convert to numpy safely
+        vals = np.array(shap_values.values)
+
+# ✅ Force correct extraction
+        try:
+            if vals.ndim == 3:          # (1, features, classes)
+                shap_vals = vals[0, :, 1]
+            elif vals.ndim == 2:        # (1, features)
+                shap_vals = vals[0]
+            else:
+                shap_vals = vals
+        except:
+            shap_vals = vals
+
+# ✅ FORCE 1D no matter what
+        shap_vals = np.squeeze(shap_vals)
+
+# ✅ FINAL SAFETY: ensure exact length match
+        shap_vals = np.resize(shap_vals, len(X.columns))
+
+# 🔍 Debug (optional - uncomment if needed)
+# st.write("Final shape:", shap_vals.shape)
+
+# ✅ Now guaranteed safe
         shap_df = pd.DataFrame({
-            "feature": X.columns,
-            "impact": shap_values.values[0][:, 1]
-        }).sort_values("impact", key=abs, ascending=False)
+            "feature": list(X.columns),
+            "impact": shap_vals.tolist()   # <-- IMPORTANT (forces 1D)
+        })
+
+# Sort
+        shap_df["abs_impact"] = shap_df["impact"].abs()
+        shap_df = shap_df.sort_values("abs_impact", ascending=False).drop(columns="abs_impact")
 
         st.dataframe(shap_df)
         st.bar_chart(shap_df.set_index("feature"))
